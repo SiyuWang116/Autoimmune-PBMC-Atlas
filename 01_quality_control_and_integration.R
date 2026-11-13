@@ -18,8 +18,6 @@ sobj <- subset(
 # Split RNA layers by patient
 sobj[["RNA"]] <- split(sobj[["RNA"]], f = sobj$Patient)
 
-sobj[["RNA"]] <- split(sobj[["RNA"]], f = sobj$Patient)
-
 sobj <- NormalizeData(sobj)
 sobj <- FindVariableFeatures(sobj)
 sobj <- ScaleData(sobj)
