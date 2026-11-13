@@ -1,0 +1,1244 @@
+# Fig. 4 and Supplementary Fig. 5: C1QC-positive monocytes.
+# Input: normalized myeloid Seurat object with RNA counts/data, UMAP,
+# and metadata Sample, majordisease, celltype. Each function uses a local copy.
+# Source this file, then call the functions listed at the end.
+# NicheNet targets: C1QC+ monocyte markers with adjusted P <0.05 and avg_log2FC >0.5.
+# Bulk ssGSEA: top 10 C1QC+ monocyte DEGs; heatmap: selected C1QC+ monocyte DEGs.
+
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(patchwork)
+library(ComplexHeatmap)
+library(grid)
+
+out_dir <- "fig4_c1qc"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+prepare_myeloid <- function(sobj) {
+  DefaultAssay(sobj) <- "RNA"
+  labels <- as.character(sobj$celltype)
+  labels[labels %in% c("Intermediate Mono", "Inter-Mono")] <- "Classical Mono_HLA-DR"
+  labels[labels == "Macrophage_C1QC"] <- "Mono_C1QC"
+  sobj$celltype <- labels
+  disease <- as.character(sobj$majordisease)
+  disease[disease %in% c("Behçet’s disease", "Behçet's disease")] <- "BD"
+  sobj$majordisease <- disease
+  sobj
+}
+mono_types <- c("Mono_C1QC", "Non-classical Mono", "Classical Mono_HLA-DR",
+                "Classical Mono_IFN-response", "Classical Mono_NR4A2", "Classical Mono")
+subtypelist <- c("Non-classical Mono" = "#F8CBA6", pDC = "#B7EA63", cDC2 = "#d5c9db",
+  "Classical Mono" = "#FADFA1", Mono_C1QC = "#0D747A", "Classical Mono_NR4A2" = "#DFF4F3",
+  "Classical Mono_IFN-response" = "#46855E", "Classical Mono_HLA-DR" = "#b8bbe7",
+  Neutrophlis = "#F99B36", Neutrophils = "#F99B36", cDC1 = "#95D4FF")
+
+# Print visible plot expressions inside functions, including open PDF devices.
+run_panel <- function(code) {
+  expr <- substitute(code)
+  env <- parent.frame()
+  expressions <- if (is.call(expr) && identical(expr[[1]], as.name("{"))) as.list(expr)[-1] else list(expr)
+  for (e in expressions) {
+    result <- withVisible(eval(e, envir = env))
+    if (result$visible && inherits(result$value, c("ggplot", "patchwork", "Heatmap", "HeatmapList")))
+      print(result$value)
+  }
+  invisible(NULL)
+}
+
+
+# Fig. 4A: sample-level proportions; denominator = all myeloid cells, >200 per sample.
+fig4A <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    meta <- sobj@meta.data
+    df <- as.data.frame(table(sobj$Sample))
+    valid_samples <- as.character(df[df$Freq > 200,]$Var1)
+    meta <- meta[meta$Sample %in% valid_samples,]
+    qc_counts <- meta %>%
+      group_by(sample = meta$Sample, disease = meta$majordisease) %>%
+      summarise(n_C1QC = sum(celltype == "Mono_C1QC"),
+                total = n(), .groups = "drop") %>%
+      mutate(prop_C1QC = n_C1QC / total)
+    qc_filtered <- qc_counts[qc_counts$disease %in% c('Healthy','BD','KD','MIS-C'),]
+    qc_filtered <- qc_filtered[qc_filtered$disease != 'Febrile control+URI',]
+    qc_filtered$disease <- factor(qc_filtered$disease,levels = c('Healthy','BD','MIS-C','KD'))
+    pdf(file.path(out_dir, 'Fig4A_C1QC_proportions.pdf'),width = 3,height = 5)
+    ggplot(qc_filtered,aes(x = disease, y = prop_C1QC)) +
+      geom_boxplot(color = '#0D747A',size = 0.6,alpha = 0.2,outlier.shape = NA) +
+      geom_jitter(color = '#0D747A',width = 0.2,size=1) +
+      theme_bw() +
+      ylab("Proportion of C1QC+ monocytes among myeloid cells") +
+      xlab("Disease group") +
+      ggtitle("") +
+      theme_classic() +
+      stat_compare_means(label = 'p.format',
+                         method = 'wilcox.test',
+                         ref.group = 'Healthy',
+                         size = 3.5) +
+      theme(
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1,size=11),
+        axis.text.y = element_text(size=11),
+        legend.position = "none"
+      )
+    dev.off()
+  })
+
+}
+
+
+# Fig. 4B: one shared UMAP; retain all input cells and the original coordinates.
+# Healthy: green; KD/BD/MIS-C: purple; other diseases: light gray.
+# Seed 123 shuffles drawing order only; no cells are removed or downsampled.
+fig4B <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    library(Seurat)
+    library(ggplot2)
+    library(dplyr)
+    meta <- sobj@meta.data
+    meta$plot_group <- "Other diseases"
+    meta$plot_group[
+      meta$majordisease == "Healthy"
+    ] <- "Healthy"
+    target_diseases <- c(
+      "KD",
+      "BD",
+      "MIS-C"
+    )
+    meta$plot_group[
+      meta$majordisease %in% target_diseases
+    ] <- "KD/BD/MIS-C"
+    sobj@meta.data <- meta
+    umap_df <- FetchData(
+      sobj,
+      vars=c(
+        "umap_1",
+        "umap_2",
+        "plot_group"
+      )
+    )
+    umap_df$plot_group <- factor(
+      umap_df$plot_group,
+      levels=c(
+        "Other diseases",
+        "Healthy",
+        "KD/BD/MIS-C"
+      )
+    )
+    set.seed(123)
+    umap_df <- umap_df[
+      sample(nrow(umap_df)),
+    ]
+    pdf(
+      file.path(out_dir, 'Fig4B_disease_UMAP.pdf'),
+      width=8,
+      height=5
+    )
+    ggplot(
+      umap_df,
+      aes(
+        umap_1,
+        umap_2,
+        color=plot_group
+      )
+    )+
+      geom_point(
+        aes(
+          alpha=plot_group,
+          size=plot_group
+        )
+      )+
+      scale_color_manual(
+        values=c(
+          "Other diseases"="#D9D9D9",
+          "Healthy"="#1b9e77",
+          "KD/BD/MIS-C"="#5b5ea6"
+        )
+      )+
+      scale_alpha_manual(
+        values=c(
+          "Other diseases"=0.15,
+          "Healthy"=0.8,
+          "KD/BD/MIS-C"=0.8
+        )
+      )+
+      scale_size_manual(
+        values=c(
+          "Other diseases"=0.15,
+          "Healthy"=0.15,
+          "KD/BD/MIS-C"=0.15
+        )
+      )+
+      theme_classic()+
+      theme(
+        panel.background=element_blank(),
+        panel.grid=element_blank(),
+        axis.line=element_line(color="black"),
+        legend.position="right",
+        legend.title=element_blank(),
+        text=element_text(size=12)
+      )+
+      labs(
+        x="UMAP 1",
+        y="UMAP 2"
+      )
+    dev.off()
+  })
+
+}
+
+
+# Fig. 4C: TNF expression across monocyte subsets.
+fig4C <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  sobj <- subset(sobj, celltype %in% mono_types)
+  run_panel({
+    sobj$celltype <- factor(sobj$celltype, levels = mono_types)
+    p <- VlnPlot(sobj, features = "TNF", group.by = "celltype", pt.size = 0, cols = subtypelist) + NoLegend()
+    ggsave(file.path(out_dir, 'Fig4C_TNF_expression.pdf'), plot = p, width = 7, height = 4)
+  })
+
+}
+
+
+# Fig. 4D: selected GO terms from the original marker enrichment table.
+fig4D <- function(go_csv) {
+
+  run_panel({
+    df <- readr::read_csv(go_csv, show_col_types = FALSE)
+    tnf_tracks <- df[grepl("tumor necrosis|TNF", df$Description, ignore.case = TRUE), ]
+    il10_tracks <- df[grepl("interleukin-10|IL-10|IL10", df$Description, ignore.case = TRUE), ]
+    df_select <- df[df$Description %in% c('response to type II interferon','myeloid leukocyte activation',
+                                         'leukocyte cell-cell adhesion','regulation of inflammatory response','interleukin-10-mediated signaling pathway',
+                                         'tumor necrosis factor production','response to tumor necrosis factor'),]
+    df_top <- df_select %>%
+      arrange(p.adjust) %>%
+      dplyr::slice(1:10) %>%
+      mutate(Description = fct_reorder(Description, -log10(p.adjust)))
+    ggplot(df_top, aes(x = Description, y = -log10(p.adjust))) +
+      geom_segment(aes(xend = Description, yend = 0), color = "gray70", size = 0.7) +
+      geom_point(size =5.8,fill='#7fbbb2',color='#7fbbb2',stroke=0,show.legend = FALSE, alpha = 1) +
+      geom_text(aes(label = Count), color = "white", size = 3) +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = "C1QC_Mono Upregulated Pathways",
+           x = NULL,
+           y = expression(-log[10](adj~P~value))) +
+      theme(panel.grid.major.y = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.grid.major= element_blank(),
+            axis.ticks = element_line(color = 'black'),
+            axis.ticks.length = unit(2.5,'pt'),
+            axis.line = element_line(colour = 'black'))
+    ggsave(file.path(out_dir, 'Fig4D_C1QC_GO.pdf'),width = 6,height = 2.5)
+  })
+
+}
+
+
+# Fig. 4E: sample/subset ROGUE scores; global Kruskal-Wallis test.
+fig4E <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    unique(sobj$celltype)
+    sobj <- subset(sobj,celltype %in% c("Non-classical Mono","Classical Mono",
+                                        "Mono_C1QC","Classical Mono_HLA-DR" ,
+                                        "Classical Mono_NR4A2" ,"Classical Mono_IFN-response" ))
+    sobj_sub <- sobj
+    set.seed(2026)
+    meta_sub <- sobj_sub@meta.data %>%
+      rownames_to_column("cell_id") %>%
+      filter(
+        !is.na(Sample),
+        !is.na(celltype),
+        Sample != "",
+        celltype != ""
+      ) %>%
+      mutate(
+        Sample = as.character(Sample),
+        celltype = as.character(celltype)
+      ) %>%
+      group_by(Sample, celltype) %>%
+      filter(n() >= 20) %>%
+      slice_sample(n = 300) %>%
+      ungroup() %>%
+      column_to_rownames("cell_id")
+    table(meta_sub$Sample, meta_sub$celltype)
+    counts_sub <- GetAssayData(
+      sobj_sub,
+      assay = "RNA",
+      layer = "counts"
+    )[, rownames(meta_sub), drop = FALSE]
+    counts_sub <- counts_sub[
+      Matrix::rowSums(counts_sub > 0) >= 3,
+      ,
+      drop = FALSE
+    ]
+    rogue_result <- ROGUE::rogue(
+      expr = counts_sub,
+      labels = meta_sub$celltype,
+      samples = meta_sub$Sample,
+      platform = "UMI",
+      min.cell.n = 10,
+      remove.outlier.n = 0
+    )
+    rogue_df <- rogue_result %>%
+      as.data.frame() %>%
+      rownames_to_column("Sample") %>%
+      pivot_longer(
+        cols = -Sample,
+        names_to = "celltype",
+        values_to = "ROGUE"
+      ) %>%
+      filter(!is.na(ROGUE))
+    rogue_df %>%
+      count(celltype, name = "n_samples") %>%
+      arrange(n_samples)
+    celltype_colors <- c(
+      "Non-classical Mono" = "#F8CBA6",
+      "pDC" = "#B7EA63",
+      "cDC2" = "#d5c9db",
+      "Classical Mono" = "#FADFA1",
+      "Mono_C1QC" = "#0D747A",
+      "Classical Mono_NR4A2" = "#DFF4F3",
+      "Classical Mono_IFN-response" = "#46855E",
+      "Classical Mono_HLA-DR" = "#b8bbe7",
+      "Neutrophlis" = "#F99B36",
+      "cDC1" = "#95D4FF"
+    )
+    plot_order <- names(celltype_colors)
+    rogue_df <- rogue_df %>%
+      filter(celltype %in% plot_order) %>%
+      mutate(celltype = factor(celltype, levels = plot_order))
+    rogue_df$celltype <- factor(
+      rogue_df$celltype,
+      levels = rogue_df %>%
+        group_by(celltype) %>%
+        summarise(median_ROGUE = median(ROGUE, na.rm = TRUE), .groups = "drop") %>%
+        arrange(median_ROGUE) %>%
+        pull(celltype)
+    )
+    ggplot(rogue_df,aes(x = celltype, y = ROGUE, fill = celltype,colour = celltype)) +
+      geom_boxplot(width = 0.68,outlier.shape = NA,linewidth = 0.8,alpha =0.22) +
+      geom_jitter(aes(color = celltype),width = 0.14,size = 1.5,alpha = 0.8,show.legend = FALSE) +
+      scale_fill_manual(values = celltype_colors) +
+      scale_color_manual(values = celltype_colors) +
+      scale_y_continuous(
+        expand = expansion(mult = c(0.02, 0.06))
+      ) +
+      labs(
+        x = NULL,
+        y = "ROGUE purity score"
+      ) +
+      theme_classic(base_size = 13) +
+      stat_compare_means(method = 'kruskal.test', label = 'p.format') +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(
+          angle = 45,
+          hjust = 1,
+          vjust = 1,
+          color = "black"
+        ),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(face = "bold"),
+        axis.line = element_line(linewidth = 0.5)
+      )
+    ggsave(file.path(out_dir, 'Fig4E_ROGUE.pdf'),width = 4,height = 5)
+  })
+
+}
+
+
+# Fig. 4F: CM/NCM signature coverage and enrichment in six pairwise DEG sets.
+fig4F <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    library(msigdbr)
+    library(dplyr)
+    library(UCell)
+    c8 <- msigdbr(
+      species = "Homo sapiens",
+      collection = "C8"
+    )
+    CM_genes <- c8 %>%
+      filter(gs_name == "TRAVAGLINI_LUNG_CLASSICAL_MONOCYTE_CELL") %>%
+      pull(gene_symbol) %>%
+      unique()
+    NCM_genes <- c8 %>%
+      filter(gs_name == "TRAVAGLINI_LUNG_NONCLASSICAL_MONOCYTE_CELL") %>%
+      pull(gene_symbol) %>%
+      unique()
+    length(CM_genes)
+    length(NCM_genes)
+    CM_genes <- intersect(CM_genes, rownames(sobj))
+    NCM_genes <- intersect(NCM_genes, rownames(sobj))
+    length(CM_genes)
+    length(NCM_genes)
+    sig <- list(
+      CM = CM_genes,
+      NCM = NCM_genes
+    )
+    library(Seurat)
+    library(dplyr)
+    library(ggplot2)
+    library(Matrix)
+    cts <- c(
+      "Classical Mono",
+      "Non-classical Mono",
+      "Mono_C1QC"
+    )
+    mono <- subset(sobj, subset = celltype %in% cts)
+    Idents(mono) <- "celltype"
+    CM_vs_NCM <- FindMarkers(
+      mono,
+      ident.1 = "Classical Mono",
+      ident.2 = "Non-classical Mono",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    CM_vs_C1QC <- FindMarkers(
+      mono,
+      ident.1 = "Classical Mono",
+      ident.2 = "Mono_C1QC",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    NCM_vs_CM <- FindMarkers(
+      mono,
+      ident.1 = "Non-classical Mono",
+      ident.2 = "Classical Mono",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    NCM_vs_C1QC <- FindMarkers(
+      mono,
+      ident.1 = "Non-classical Mono",
+      ident.2 = "Mono_C1QC",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    C1QC_vs_CM <- FindMarkers(
+      mono,
+      ident.1 = "Mono_C1QC",
+      ident.2 = "Classical Mono",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    C1QC_vs_NCM <- FindMarkers(
+      mono,
+      ident.1 = "Mono_C1QC",
+      ident.2 = "Non-classical Mono",
+      only.pos = TRUE,
+      min.pct = 0.1,
+      logfc.threshold = 0.25
+    )
+    deg_list <- list(
+      "CM > NCM"    = CM_vs_NCM,
+      "CM > C1QC"   = CM_vs_C1QC,
+      "NCM > CM"    = NCM_vs_CM,
+      "NCM > C1QC"  = NCM_vs_C1QC,
+      "C1QC > CM"   = C1QC_vs_CM,
+      "C1QC > NCM"  = C1QC_vs_NCM
+    )
+    library(tibble)
+    deg_list_sig <- lapply(deg_list, function(x) {
+      x %>%
+        rownames_to_column("gene") %>%
+        filter(
+          p_val_adj < 0.05,
+          avg_log2FC > 0.25
+        )
+    })
+    sapply(deg_list_sig, nrow)
+    gene_sets <- list(CM_genes = CM_genes,NCM_genes = NCM_genes)
+    plot_df <- bind_rows(
+      lapply(names(deg_list_sig), function(deg_name) {
+        deg <- deg_list_sig[[deg_name]]
+        bind_rows(
+          lapply(names(gene_sets), function(gs_name) {
+            gs <- gene_sets[[gs_name]]
+            overlap <- intersect(deg$gene, gs)
+            hit_df <- deg %>%
+              filter(gene %in% overlap)
+            data.frame(
+              DEG_group = deg_name,
+              GeneSet = gs_name,
+              n_DEG = nrow(deg),
+              n_overlap = length(overlap),
+              overlap_pct = length(overlap) / nrow(deg) * 100,
+              mean_logFC = ifelse(
+                length(overlap) > 0,
+                mean(hit_df$avg_log2FC, na.rm = TRUE),
+                NA
+              )
+            )
+          })
+        )
+      })
+    )
+    library(Matrix)
+    expr <- GetAssayData(mono, layer = "data")
+    universe <- rownames(expr)[Matrix::rowSums(expr > 0) > 0]
+    N_universe <- length(universe)
+    N_universe
+    CM_set  <- intersect(CM_genes, universe)
+    NCM_set <- intersect(NCM_genes, universe)
+    length(CM_set)
+    length(NCM_set)
+    gs_size <- c(
+      CM_genes  = length(CM_set),
+      NCM_genes = length(NCM_set)
+    )
+    plot_df2 <- plot_df %>%
+      mutate(
+        signature_coverage = case_when(
+          GeneSet == "CM_genes"  ~ n_overlap / gs_size["CM_genes"]  * 100,
+          GeneSet == "NCM_genes" ~ n_overlap / gs_size["NCM_genes"] * 100
+        ),
+        observed = n_overlap / n_DEG,
+        expected = case_when(
+          GeneSet == "CM_genes"  ~ gs_size["CM_genes"]  / N_universe,
+          GeneSet == "NCM_genes" ~ gs_size["NCM_genes"] / N_universe
+        ),
+        enrichment = observed / expected,
+        log2_enrichment = log2(enrichment)
+      )
+    plot_df2 %>%
+      select(
+        DEG_group,
+        GeneSet,
+        n_overlap,
+        signature_coverage,
+        enrichment,
+        log2_enrichment,
+        mean_logFC
+      )
+    library(ggplot2)
+    library(dplyr)
+    plot_df2 <- plot_df2 %>%
+      mutate(
+        Source = case_when(
+          grepl("^CM >", DEG_group)   ~ "CM",
+          grepl("^NCM >", DEG_group)  ~ "NCM",
+          grepl("^C1QC >", DEG_group) ~ "C1QC"
+        ),
+        Comparison = case_when(
+          DEG_group == "CM > NCM"    ~ "> NCM",
+          DEG_group == "CM > C1QC"   ~ "> C1QC",
+          DEG_group == "NCM > CM"    ~ "> CM",
+          DEG_group == "NCM > C1QC"  ~ "> C1QC",
+          DEG_group == "C1QC > CM"   ~ "> CM",
+          DEG_group == "C1QC > NCM"  ~ "> NCM"
+        )
+      )
+    plot_df2$Source <- factor(
+      plot_df2$Source,
+      levels = c("CM", "NCM", "C1QC")
+    )
+    plot_df2$GeneSet <- factor(
+      plot_df2$GeneSet,
+      levels = c("NCM_genes", "CM_genes")
+    )
+    plot_df2$Comparison <- factor(
+      plot_df2$Comparison,
+      levels = c("> NCM", "> CM", "> C1QC")
+    )
+    deg_for_c1qc_herter <- ggplot(
+      plot_df2,
+      aes(x = Comparison, y = GeneSet)
+    ) +
+      geom_point(
+        aes(
+          size = signature_coverage,
+          fill = log2_enrichment
+        ),
+        shape = 21,
+        color = "black",
+        stroke = 0.7
+      ) +
+      facet_grid(
+        . ~ Source,
+        scales = "free_x",
+        space = "free_x"
+      ) +
+      scale_size_area(
+        max_size = 14,
+        name = "Signature coverage (%)"
+      ) +
+      scale_fill_gradient2(
+        low = "#8c9eba",
+        mid = "#f3dbd6",
+        high = "#d54846",
+        midpoint = 3,
+        name = expression(log[2]~enrichment)
+      ) +
+      labs(
+        x = NULL,
+        y = NULL
+      ) +
+      theme_classic() +
+      theme(
+        strip.background = element_blank(),
+        strip.text = element_text(
+          face = "bold",
+          size = 11
+        ),
+        axis.text.x = element_text(
+          angle = 45,
+          hjust = 1,
+          size = 9
+        ),
+        axis.text.y = element_text(
+          size = 9
+        ),
+        legend.title = element_text(
+          size = 8
+        ),
+        legend.text = element_text(
+          size = 7
+        ),
+        legend.key.size = unit(0.35, "cm"),
+        legend.spacing.y = unit(0.15, "cm"),
+        panel.spacing.x = unit(1.2, "lines")
+      ) +
+      guides(
+        size = guide_legend(
+          title.position = "top",
+          override.aes = list(
+            shape = 21,
+            color = "black",
+            fill = "white",
+            stroke = 0.5,
+            alpha = 1
+          )
+        ),
+        fill = guide_colorbar(
+          title.position = "top",
+          barwidth = unit(0.35, "cm"),
+          barheight = unit(2.0, "cm")
+        )
+      )
+    ggsave(file.path(out_dir, 'Fig4F_signature_enrichment.pdf'),plot = deg_for_c1qc_herter,width = 6,height = 2)
+  })
+
+}
+
+
+# Fig. 4G: Monocle3 trajectory; original data-layer input and Classical Mono root retained.
+fig4G <- function(sobj, expression_layer = "data") {
+  sobj <- prepare_myeloid(sobj)
+  sobj <- subset(sobj, celltype %in% mono_types)
+  run_panel({
+    library(Seurat)
+    library(monocle3)
+    library(ggplot2)
+    mat <- GetAssayData(
+      sobj,
+      layer = expression_layer
+    )
+    cellInfo <- sobj@meta.data
+    geneInfo <- data.frame(
+      gene_short_name = rownames(mat),
+      row.names = rownames(mat)
+    )
+    cds <- new_cell_data_set(
+      expression_data = mat,
+      cell_metadata = cellInfo,
+      gene_metadata = geneInfo
+    )
+    cds <- preprocess_cds(
+      cds,
+      num_dim = 50
+    )
+    reducedDim(cds, "UMAP") <- Embeddings(
+      sobj,
+      "umap"
+    )
+    cds <- cluster_cells(
+      cds,
+      cluster_method = "louvain"
+    )
+    cds <- learn_graph(
+      cds,
+      use_partition = TRUE,
+      verbose = TRUE,
+      learn_graph_control = list(
+        minimal_branch_len = 10
+      )
+    )
+    start <- c("Classical Mono")
+    closest_vertex <- cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+    closest_vertex <- as.matrix(
+      closest_vertex[colnames(cds), ]
+    )
+    root_pr_nodes <- igraph::V(
+      principal_graph(cds)[["UMAP"]]
+    )$name
+    flag <- closest_vertex[
+      as.character(colData(cds)$celltype) %in% start,
+    ]
+    flag <- as.numeric(
+      names(which.max(table(flag)))
+    )
+    root_pr_nodes <- root_pr_nodes[flag]
+    cds <- order_cells(
+      cds,
+      root_pr_nodes = root_pr_nodes
+    )
+    subtypelist <- c(
+      "Non-classical Mono" = "#F8CBA6",
+      "pDC" = "#B7EA63",
+      "cDC2" = "#d5c9db",
+      "Classical Mono" = "#FADFA1",
+      "Mono_C1QC" = "#0D747A",
+      "Classical Mono_NR4A2" = "#DFF4F3",
+      "Classical Mono_IFN-response" = "#46855E",
+      "Classical Mono_HLA-DR" = "#b8bbe7",
+      "Neutrophlis" = "#F99B36",
+      "cDC1" = "#95D4FF"
+    )
+    p1 <- plot_cells(
+      cds,
+      color_cells_by = "celltype",
+      label_cell_groups = FALSE,
+      label_leaves = FALSE,
+      label_branch_points = FALSE,
+      label_roots = FALSE,
+      show_trajectory_graph = TRUE,
+      trajectory_graph_segment_size = 0.6,
+      cell_size = 0.35
+    ) +
+      scale_color_manual(
+        values = subtypelist
+      ) +
+      theme_classic()
+    p1
+    ggsave(
+      file.path(out_dir, 'Fig4G_trajectory.pdf'),
+      p1,
+      width = 7.5,
+      height = 5
+    )
+    p2 <- plot_cells(
+      cds,
+      color_cells_by = "pseudotime",
+      label_cell_groups = FALSE,
+      label_leaves = FALSE,
+      label_branch_points = FALSE,
+      label_roots = TRUE,
+      show_trajectory_graph = TRUE,
+      trajectory_graph_segment_size = 0.6,
+      cell_size = 0.35
+    )
+    p2
+    ggsave(
+      file.path(out_dir, 'trajectory_pseudotime.pdf'),
+      p2,
+      width = 7.5,
+      height = 5
+    )
+    saveRDS(
+      cds,
+      file = file.path(out_dir, "myeloid_monocle3_final_cds.rds")
+    )
+    time <- pseudotime(cds)
+    time[is.infinite(time)] <- NA
+    time <- data.frame(
+      cell = names(time),
+      pseudotime = time
+    )
+    write.table(
+      time,
+      file = file.path(out_dir, "myeloid_pseudotime.txt"),
+      sep = "\t",
+      quote = FALSE,
+      row.names = FALSE
+    )
+  })
+  invisible(cds)
+}
+
+
+# Fig. 4H: SingleR assignments, not trajectory-derived transition probabilities; pie uses scores >0.3.
+fig4H <- function(sobj) {
+  mye <- prepare_myeloid(sobj)
+  run_panel({
+    library(SingleR)
+    library(Seurat)
+    library(ggplot2)
+    library(pheatmap)
+    ref_sub <- subset(mye, celltype %in% c("Classical Mono_HLA-DR", "Non-classical Mono"))
+    ref_counts <- GetAssayData(ref_sub, layer = "data")
+    ref_labels <- ref_sub$celltype
+    query_sub <- subset(mye, celltype == "Mono_C1QC")
+    query_counts <- GetAssayData(query_sub, layer = "data")
+    pred_mono <- SingleR(test = query_counts,
+                         ref = ref_counts,
+                         labels = ref_labels,
+                         genes = "de",
+                         de.n = 10)
+    query_max_scores <- apply(pred_mono$scores, 1, max)
+    keep_indices <- query_max_scores > 0.3
+    if (!any(keep_indices)) stop("No SingleR predictions exceed the 0.3 score threshold.")
+    final_predictions <- pred_mono$labels[keep_indices]
+    print(table(final_predictions))
+    print(prop.table(table(final_predictions)))
+    plot_data <- as.data.frame(prop.table(table(final_predictions)))
+    colnames(plot_data) <- c("Source", "Fraction")
+    plot_data <- plot_data %>%
+      mutate(
+        Percentage = paste0(round(Fraction * 100, 2), "%"),
+        label_pos = cumsum(Fraction) - (Fraction / 2)
+      )
+    ggplot(plot_data, aes(x = "", y = Fraction, fill = Source)) +
+      geom_bar(stat = "identity", linewidth = 0.8, color = "white") +
+      coord_polar(theta = "y", start = 0) +
+      scale_fill_manual(values = c("Classical Mono_HLA-DR" = "#d3ecd5", "Non-classical Mono" = "#abc9ea")) +
+      geom_text(aes(y = label_pos, label = Percentage), color = "#333333", size = 5, fontface = "bold") +
+      theme_void() +
+      theme(
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold", vjust = 2),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 11, face = "plain"),
+        plot.margin = margin(1, 1, 1, 1, "cm")
+      ) +
+      labs(title = "Predicted Origin of Mono_C1QC Cells")
+    ggsave(file.path(out_dir, 'Fig4H_reference_assignments.pdf'),width = 6, height = 5)
+  })
+# I-J retain all assignments, matching the original differential analysis.
+  query_sub$reference_label <- pred_mono$labels[match(colnames(query_sub), rownames(pred_mono))]
+  write.csv(data.frame(Cell = rownames(pred_mono), Label = pred_mono$labels,
+                      MaxScore = query_max_scores, RetainedForPie = keep_indices),
+            file.path(out_dir, "Fig4H_SingleR_predictions.csv"), row.names = FALSE)
+  invisible(list(query = query_sub, predictions = pred_mono, fractions = plot_data))
+}
+
+
+# Fig. 4I: GO of genes upregulated in NCM-associated versus HLA-DR CM-associated C1QC cells.
+fig4I <- function(query) {
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  sobj <- query
+  DefaultAssay(sobj) <- "RNA"
+  run_panel({
+    what <- FindMarkers(sobj,group.by = 'reference_label',ident.1 = 'Non-classical Mono',ident.2 = 'Classical Mono_HLA-DR')
+    up <- what[what$avg_log2FC > 0.25 & what$p_val_adj < 0.05,]
+    up_go_enrich <- enrichGO(gene = rownames(up),
+                          OrgDb = org.Hs.eg.db,
+                          keyType = "SYMBOL",
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05)
+    down <- what[what$avg_log2FC < -0.25 & what$p_val_adj < 0.05,]
+    down_go_enrich <- enrichGO(gene = rownames(down),
+                          OrgDb = org.Hs.eg.db,
+                          keyType = "SYMBOL",
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05)
+    df <- as.data.frame(up_go_enrich)
+    df_select <- df[df$Description %in% c('tumor necrosis factor production',
+                                          'leukocyte mediated cytotoxicity',
+                                          'inflammatory response to antigenic stimulus',
+                                          'response to type II interferon'),]
+    df_top <- df_select %>%
+      arrange(p.adjust) %>%
+      dplyr::slice(1:8) %>%
+      mutate(Description = fct_reorder(Description, -log10(p.adjust)))
+    ggplot(df_top, aes(x = Description, y = -log10(p.adjust))) +
+      geom_segment(aes(xend = Description, yend = 0), color = "gray70", size = 0.7) +
+      geom_point(size =5,fill='#719fd8',color='#719fd8',stroke=0,show.legend = FALSE, alpha = 1) +
+      geom_text(aes(label = Count), color = "white", size = 2) +
+      coord_flip() +
+      theme_minimal() +
+      labs(title = "C1QC_Mono Upregulated Pathways",
+           x = NULL,
+           y = expression(-log[10](adj~P~value))) +
+      theme(panel.grid.major.y = element_blank(),
+            panel.grid.minor = element_blank(),
+            panel.grid.major= element_blank(),
+            axis.ticks = element_line(color = 'black'),
+            axis.ticks.length = unit(2.5,'pt'),
+            axis.line = element_line(colour = 'black'))
+    ggsave(file.path(out_dir, 'Fig4I_reference_subset_GO.pdf'),width = 6,height = 2)
+  })
+
+}
+
+
+# Fig. 4J: TNF, IFITM2, STAB1 and CD163 expression by reference assignment.
+fig4J <- function(query) {
+  sobj <- query
+  DefaultAssay(sobj) <- "RNA"
+  run_panel({
+    library(patchwork)
+    genes_to_plot <- c('TNF','IFITM2','STAB1','CD163')
+    plot_list <- lapply(seq_along(genes_to_plot), function(i) {
+      gene <- genes_to_plot[i]
+    plot_data <- FetchData(sobj, vars = c(gene, "reference_label"))
+    colnames(plot_data) <- c("gene", "celltype")
+    all_groups <- levels(factor(plot_data$celltype))
+    comparisons_list <- lapply(all_groups[all_groups != "Non-classical Mono"],
+                                 function(x) c("Non-classical Mono", x))
+    morandi_colors <- c('Non-classical Mono' = '#abc9ea', 'Classical Mono_HLA-DR' = '#d3ecd5')
+    ggplot(plot_data, aes(x = celltype, y = gene, fill = celltype, color = celltype)) +
+        geom_violin(trim = TRUE, scale = "width", alpha = 0.85, linewidth = 0) +
+        geom_boxplot(width = 0.12,
+                     fill = "white",
+                     color = "#222222",
+                     linewidth = 0.4,
+                     outlier.shape = NA,
+                     alpha = 0.9,
+                     position = position_dodge(0.9)) +
+        stat_compare_means(comparisons = comparisons_list,
+                           method = "wilcox.test",
+                           label = "p.format",
+                           step.increase = 0.12,
+                           tip.length = 0.02,
+                           size = 3.2,
+                           color = "#444444") +
+        scale_fill_manual(values = morandi_colors) +
+        scale_color_manual(values = rep(NA, length(all_groups))) +
+        theme_classic() +
+        labs(title = gene, y = "Expression Level") +
+        theme(
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "black", face = "bold"),
+          axis.title.y = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5, face = "bold.italic", size = 14, color = "#222222"),
+          axis.line = element_line(color = "#777777", linewidth = 0.5),
+          legend.position = "none"
+        )
+    })
+    final_fig <- wrap_plots(plot_list, ncol = 4)
+    pdf(file.path(out_dir, 'Fig4J_reference_subset_expression.pdf'), width = 12, height = 3.5)
+    print(final_fig)
+    dev.off()
+  })
+
+}
+
+
+# Fig. 4K-L: corrected AUPR and target regulatory potential; provide final expressed-gene lists.
+fig4KL <- function(c1qc_markers, expressed_genes_receiver, expressed_genes_sender, ligand_target_matrix, lr_network) {
+  library(nichenetr)
+  stopifnot(all(c("gene", "p_val_adj", "avg_log2FC") %in% colnames(c1qc_markers)))
+  geneset <- c1qc_markers %>%
+    filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>%
+    pull(gene) %>% unique()
+  stopifnot(length(geneset) > 0)
+  run_panel({
+    geneset_oi <- geneset %>% .[. %in% rownames(ligand_target_matrix)]
+    background_expressed_genes <- expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+    ligands = lr_network %>% pull(from) %>% unique()
+    expressed_ligands = intersect(ligands,expressed_genes_sender)
+    receptors = lr_network %>% pull(to) %>% unique()
+    expressed_receptors = intersect(receptors,expressed_genes_receiver)
+    lr_network_expressed = lr_network %>% filter(from %in% expressed_ligands & to %in% expressed_receptors)
+    potential_ligands = lr_network_expressed %>% pull(from) %>% unique()
+    ligand_activities = predict_ligand_activities(geneset = geneset_oi,
+                                                  background_expressed_genes = background_expressed_genes,
+                                                  ligand_target_matrix = ligand_target_matrix,
+                                                  potential_ligands = potential_ligands)
+    ligand_activities <- ligand_activities %>%
+      arrange(-aupr_corrected) %>%
+      mutate(rank = rank(dplyr::desc(aupr_corrected)))
+    best_upstream_ligands <- ligand_activities %>%
+      filter(auroc > 0,
+             aupr > 0,
+             aupr_corrected > 0,
+             pearson > 0) %>%
+      pull(test_ligand)
+    best_upstream_ligands <- ligand_activities %>% top_n(10, aupr_corrected) %>% arrange(-aupr_corrected) %>% pull(test_ligand)
+    p_hist_lig_activity <- ggplot(ligand_activities, aes(x=aupr_corrected)) +
+      geom_histogram(color="black", fill="darkorange")  +
+      geom_vline(aes(xintercept=min(ligand_activities %>% top_n(10, aupr_corrected) %>% pull(aupr_corrected))),
+                 color="red", linetype="dashed", linewidth=1) +
+      labs(x="Ligand activity (corrected AUPR)", y = "# ligands") + theme_classic()
+    vis_ligand_aupr <- ligand_activities %>% dplyr::filter(test_ligand %in% best_upstream_ligands) %>%
+      column_to_rownames("test_ligand") %>% dplyr::select(aupr_corrected) %>% arrange(aupr_corrected) %>% as.matrix()
+    p_vis_ligand_aupr <- (make_heatmap_ggplot(vis_ligand_aupr,
+                                              "Prioritized ligands", "Ligand activity",
+                                              legend_title = "Corrected AUPR", color = "#639494") +
+                            theme(
+                              axis.text.x.top = element_blank()
+                            )) +
+      guides(fill = guide_colorbar(barwidth = 10, barheight = 0.75))
+    ggsave(file.path(out_dir, 'Fig4K_ligand_activity.pdf'),plot = p_vis_ligand_aupr, width = 1.7,height = 8)
+    ggsave(file.path(out_dir, 'bestligands_10_bar.pdf'),plot = p_vis_ligand_aupr, width = 4,height = 8)
+    library(dplyr)
+    active_ligand_target_links_df = best_upstream_ligands %>% lapply(get_weighted_ligand_target_links,geneset = geneset_oi, ligand_target_matrix = ligand_target_matrix, n = 2500) %>% bind_rows()
+    active_ligand_target_links_df <- na.omit(active_ligand_target_links_df)
+    active_ligand_target_links = prepare_ligand_target_visualization(ligand_target_df = active_ligand_target_links_df, ligand_target_matrix = ligand_target_matrix, cutoff = 0.30)
+    order_ligands = intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+    order_targets = active_ligand_target_links_df$target %>% unique()
+    order_targets <- intersect(order_targets, rownames(active_ligand_target_links))
+    order_ligands <- intersect(order_ligands, colnames(active_ligand_target_links))
+    vis_ligand_target = active_ligand_target_links[order_targets,order_ligands] %>% t()
+    target_total_weight <- rowSums(active_ligand_target_links)
+    order_targets_top60 <- names(sort(target_total_weight, decreasing = TRUE))[seq_len(min(60, nrow(active_ligand_target_links)))]
+    vis_ligand_target_top60 <- active_ligand_target_links[order_targets_top60, order_ligands] %>% t()
+    all(colnames(vis_ligand_target_top60) == order_targets_top60)
+    p_ligand_target_network <- vis_ligand_target_top60 %>%
+      make_heatmap_ggplot("Prioritized ligands","Shared genes",
+                          color = "#608297",
+                          legend_position = "bottom",
+                          x_axis_position = "top",
+                          legend_title = "Regulatory potential") +
+      scale_fill_gradient2(low = "whitesmoke",
+                           high = "#608297") +
+      scale_y_discrete(limits=rownames(vis_ligand_target))+
+      theme(axis.text.x = element_text(face = "italic"))
+    ggsave(file.path(out_dir, 'Fig4L_ligand_target.pdf'),
+           p_ligand_target_network,
+           width=9.48,
+           height=3.45,
+           dpi = 3000,
+           units = 'in')
+  })
+
+}
+
+
+# Supplementary Fig. 5A/B/E: myeloid UMAP, C1Q expression, and monocyte markers.
+sfig5ABE <- function(sobj) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    p <- DimPlot(sobj, group.by = "celltype", cols = subtypelist)
+    ggsave(file.path(out_dir, 'SFig5A_myeloid_UMAP.pdf'), plot = p, width = 7, height = 4)
+    p <- FeaturePlot(sobj, features = c("C1QA", "C1QB", "C1QC"), cols = c("#e0e6ed", "#2f4f4f"), ncol = 3)
+    pdf(file.path(out_dir, 'SFig5B_C1Q_expression.pdf'), width = 10, height = 3.5)
+    print(p)
+    dev.off()
+    mono <- subset(sobj, celltype %in% mono_types)
+    p <- DotPlot(mono, features = c("CD14", "S100A8", "FCGR3A", "CX3CR1", "NR4A2", "NR4A1", "IFI44L", "MX1", "C1QA", "C1QB", "C1QC"), group.by = "celltype", cols = c("#e0e6ed", "#2f4f4f")) + RotatedAxis()
+    ggsave(file.path(out_dir, 'SFig5E_monocyte_markers.pdf'), plot = p, width = 8, height = 4)
+  })
+
+}
+
+
+# Supplementary Fig. 5C-D: selected C1QC DEGs and top-10 DEG ssGSEA scores.
+# Supply a C1QC-only marker table in the original DEG ranking order.
+sfig5CD <- function(series_matrix, platform_annotation, c1qc_markers, heatmap_genes) {
+  stopifnot("gene" %in% colnames(c1qc_markers), length(heatmap_genes) > 0)
+  signature_genes <- head(unique(as.character(c1qc_markers$gene)), 10)
+  stopifnot(length(signature_genes) == 10, !anyNA(signature_genes))
+  run_panel({
+    data <- read.table(series_matrix,
+                       header = TRUE,
+                       sep = "\t",
+                       quote = "\"",
+                       fill = TRUE,
+                       comment.char = "!",
+                       row.names = 1,
+                       check.names = FALSE)
+    library(data.table)
+    anno_clean <- fread(platform_annotation,
+                        skip = "Array_Address_Id",
+                        fill = TRUE,
+                        sep = "\t")
+    colnames(anno_clean)
+    c1qc_probe <- anno_clean[anno_clean$ILMN_Gene == "C1QC", .(Probe_Id, ILMN_Gene)]
+    print(c1qc_probe)
+    library(GSVA)
+    library(limma)
+    library(ggplot2)
+    anno_map <- anno_clean[, c("Probe_Id", "ILMN_Gene")]
+    common_ids <- intersect(rownames(data), anno_map$Probe_Id)
+    data_sub <- data[common_ids, ]
+    data_sub$Symbol <- anno_map$ILMN_Gene[match(common_ids, anno_map$Probe_Id)]
+    expr_only <- data_sub[, -ncol(data_sub)]
+    genes_only <- data_sub$Symbol
+    final_mat <- avereps(expr_only, ID = genes_only)
+    dim(final_mat)
+    "C1QC" %in% rownames(final_mat)
+    all_header <- readLines(series_matrix, n = 100)
+    gsm_line <- grep("^!Sample_geo_accession", all_header, value = TRUE)
+    group_line <- grep("final condition", all_header, value = TRUE)
+    gsm_ids <- strsplit(gsm_line, "\t")[[1]][-1]
+    gsm_ids <- gsub("\"", "", gsm_ids)
+    groups <- strsplit(group_line, "\t")[[1]][-1]
+    groups <- gsub("\"", "", groups)
+    groups <- gsub("status: ", "", groups)
+    group_list <- groups
+    names(group_list) <- gsm_ids
+    group_raw <- as.character(group_list)
+    names(group_raw) <- names(group_list)
+    group_new <- rep(NA, length(group_raw))
+    names(group_new) <- names(group_raw)
+    group_new[group_raw == "final condition: healthy"] <- "Control"
+    group_new[group_raw == "final condition: inKD"] <- "inKD"
+    group_new[group_raw == "final condition: cKD"] <- "cKD"
+    table(group_new, useNA = "ifany")
+    keep_samples <- intersect(
+      names(group_new)[!is.na(group_new)],
+      colnames(final_mat)
+    )
+    final_mat_filtered <- final_mat[, keep_samples]
+    group_final <- group_new[keep_samples]
+    group_final <- factor(group_final, levels = c("Control", "inKD", "cKD"))
+    all(colnames(final_mat_filtered) == names(group_final))
+    table(group_final, useNA = "ifany")
+    top_genes <- signature_genes
+    final_mat_filtered[is.nan(final_mat_filtered)] <- NA
+    final_mat_filtered <- t(apply(final_mat_filtered, 1, function(x) {
+      x[is.na(x)] <- median(x, na.rm = TRUE)
+      x
+    }))
+    final_mat_filtered <- as.matrix(final_mat_filtered)
+    gene_set <- list(
+      C1Q_nonclassical_monocyte = top_genes
+    )
+    param <- ssgseaParam(
+      exprData = final_mat_filtered,
+      geneSets = gene_set,
+      alpha = 0.25,
+      normalize = TRUE
+    )
+    ssgsea_score <- gsva(param)
+    score_df <- data.frame(
+      Sample = colnames(ssgsea_score),
+      Score = as.numeric(ssgsea_score[1, ]),
+      Group = group_final[colnames(ssgsea_score)]
+    )
+    table(score_df$Group, useNA = "ifany")
+    head(score_df)
+    score_df$Group <- factor(score_df$Group,levels = c("Control", "inKD", "cKD"))
+    n_df <- score_df %>%count(Group)
+    x_labs <- paste0(levels(score_df$Group),"\n(n = ",n_df$n[match(levels(score_df$Group), n_df$Group)],")")
+    names(x_labs) <- levels(score_df$Group)
+    my_comparisons <- list(c("Control", "inKD"),c("Control", "cKD"),c("inKD", "cKD"))
+    p <- ggplot(score_df, aes(x = Group, y = Score, fill = Group, color = Group)) +
+      geom_boxplot(width = 0.55,alpha = 0.28,outlier.shape = NA,linewidth = 0.9) +
+      geom_jitter(width = 0.13,size = 2.2,alpha = 0.65,shape = 21,stroke = 0.8) +
+      stat_compare_means(
+        comparisons = my_comparisons,
+        method = "wilcox.test",
+        label = "p.format",
+        tip.length = 0.01,
+        bracket.size = 0.5,
+        size = 4.2
+      ) +
+      scale_x_discrete(labels = x_labs) +
+      scale_fill_manual(values = c("Control" = "#999999","inKD"= "#bfdfd2","cKD"= "#51999f")) +
+      scale_color_manual(values = c("Control" = "#999999","inKD"= "#bfdfd2","cKD" = "#51999f")) +
+      theme_classic() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 17),
+        axis.title.y = element_text(size = 15, face = "bold"),
+        axis.text.x = element_text(size = 13, color = "black"),
+        axis.text.y = element_text(size = 12, color = "black"),
+        legend.position = "right",
+        legend.title = element_text(face = "bold"),
+        axis.line = element_line(linewidth = 0.8)
+      ) +
+      labs(
+        x = "",
+        y = "ssGSEA score",
+        title = "C1QC+ monocyte signature in KD",
+        fill = "Group",
+        color = "Group"
+      )
+    pdf(file.path(out_dir, 'SFig5D_bulk_signature.pdf'),width = 4,height = 5)
+    p + stat_summary(fun = median,geom = "line",aes(group = 1),linewidth = 0.8,linetype = "dashed",
+                     color = "grey55"
+      ) + stat_summary(fun = median,geom = "point",aes(group = 1),size = 2.8,color = "grey55")
+    dev.off()
+    group_factor <- factor(group_final, levels = c("Control", "inKD", "cKD"))
+    sort_idx <- order(group_factor)
+    valid_genes <- intersect(heatmap_genes, rownames(final_mat_filtered))
+    stopifnot(length(valid_genes) > 0)
+    plot_mat <- final_mat_filtered[valid_genes, sort_idx]
+    plot_mat_scaled <- t(apply(plot_mat, 1, scale))
+    colnames(plot_mat_scaled) <- colnames(plot_mat)
+    rownames(plot_mat_scaled) <- rownames(plot_mat)
+    plot_mat_scaled[plot_mat_scaled > 2] <- 2
+    plot_mat_scaled[plot_mat_scaled < -2] <- -2
+    library(ComplexHeatmap)
+    library(circlize)
+    col_fun = colorRamp2(c(-2, 0, 2), c("#2166ac", "white", "#b2182b"))
+    ha = HeatmapAnnotation(
+      Status = group_factor[sort_idx],
+      col = list(Status = c("Control" = "#999999", "inKD" = "#bfdfd2", "cKD" = "#51999f")),
+      simple_anno_size = unit(4, "mm"),
+      show_annotation_name = FALSE
+    )
+    pdf(file.path(out_dir, 'SFig5C_bulk_expression.pdf'),width = 5,height = 3)
+    ht = Heatmap(plot_mat_scaled,
+                 name = "Z-score",
+                 col = col_fun,
+                 top_annotation = ha,
+                 cluster_columns = FALSE,
+                 column_split = group_factor[sort_idx],
+                 column_title = NULL,
+                 cluster_rows = T,
+                 row_names_side = "right",
+                 row_names_gp = gpar(fontsize = 10, fontface = "italic"),
+                 show_column_names = FALSE,
+                 border = NA,
+                 rect_gp = gpar(col = "white", lwd = 0),
+                 heatmap_legend_param = list(
+                   title = "Z-score",
+                   at = c(-2, 0, 2),
+                   labels = c("-2", "0", "2")
+                 )
+    )
+    print(ht)
+    dev.off()
+  })
+
+}
+
+
+# Supplementary Fig. 5F: mean raw AUCell activities per subset, row-scaled.
+sfig5F <- function(sobj, loom_file) {
+  sobj <- prepare_myeloid(sobj)
+  run_panel({
+    library(SCopeLoomR)
+    library(AUCell)
+    library(circlize)
+    loom <- open_loom(loom_file)
+    regulon_auc <- get_regulons_AUC(loom, column.attr.name = "RegulonsAUC")
+    close_loom(loom)
+    auc_mat <- getAUC(regulon_auc)
+    features_to_plot <- c("STAT1(+)", "ETS2(+)", "JUN(+)", "KLF3(+)", "TCF7L2(+)", "IRF1(+)", "IRF7(+)", "KLF2(+)", "FOS(+)", "CEBPD(+)", "NFKB1(+)", "KLF4(+)")
+    common_cells <- intersect(colnames(auc_mat), colnames(sobj))
+    stopifnot(length(common_cells) > 0, all(features_to_plot %in% rownames(auc_mat)))
+    labels <- sobj$celltype[match(common_cells, colnames(sobj))]
+    groups <- c("Classical Mono", "Non-classical Mono", "Mono_C1QC")
+    stopifnot(all(groups %in% labels))
+    exp_mat <- sapply(groups, function(g) rowMeans(auc_mat[features_to_plot, common_cells[labels == g], drop = FALSE]))
+    exp_mat_scaled <- t(scale(t(exp_mat)))
+    pdf(file.path(out_dir, 'SFig5F_regulon_activity.pdf'), width = 3.85, height = 6)
+    ht <- Heatmap(exp_mat_scaled, name = "Regulon activity (Z-score)",
+      col = colorRamp2(c(-1, 0, 1), c("#eef3f8", "#9dabd0", "#424d95")),
+      rect_gp = gpar(col = "white", lwd = 5), cluster_rows = FALSE, cluster_columns = FALSE)
+    draw(ht)
+    dev.off()
+  })
+
+}
+
+
+# Run panels after loading the myeloid object into sobj.
+# fig4A(sobj); fig4B(sobj); fig4C(sobj)
+# fig4D("C1QC_Mono_GO_lfc0.5_padj0.05.csv")
+# fig4E(sobj); fig4F(sobj); cds <- fig4G(sobj)
+# origin <- fig4H(sobj)
+# fig4I(origin$query); fig4J(origin$query)
+# fig4KL(c1qc_markers, expressed_genes_receiver, expressed_genes_sender, ligand_target_matrix, lr_network)
+# sfig5ABE(sobj)
+# sfig5CD("GSE68004_series_matrix.txt", "GPL10558_HumanHT-12_V4_0_R2_15002873_B.txt.gz", c1qc_markers, heatmap_genes)
+# sfig5F(sobj, "Mono_SCENIC.loom")
