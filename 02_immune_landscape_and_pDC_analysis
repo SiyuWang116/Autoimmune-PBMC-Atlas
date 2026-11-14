@@ -1,0 +1,292 @@
+# Fig. 1A-G and supporting Supplementary Figs. 1-2.
+# Inputs: annotated, normalized Seurat objects with existing UMAP coordinates.
+# Atlas metadata: Sample, Data, majordisease, majorcluster, celltype.
+# Use separate atlas, pDC, blood-myeloid, intestinal, and skin objects.
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+
+out_dir <- "fig1_landscape"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+save_fig <- function(p, filename, width = 6, height = 4) {
+  ggsave(file.path(out_dir, filename), plot = p, width = width, height = height)
+}
+standardize_disease <- function(x) {
+  x <- trimws(as.character(x))
+  map <- c("Behçet’s disease" = "BD", "Behçet's disease" = "BD",
+    "Systemic lupus erythematosus" = "SLE", "idiopathic intracranial hypertension" = "IIH",
+    "Giant cell arteritis" = "GCA", "Mutiple sclerosis" = "MS", "Multiple sclerosis" = "MS",
+    PSS = "pSS", "primary Sjögren’s syndrome" = "pSS", "Spondyloarthritis" = "axSpA",
+    AS = "axSpA", "Co-morbid CD and Spondyloarthritis" = "CD-axSpA",
+    "Febrile control+URI" = "FEB")
+  hit <- x %in% names(map); x[hit] <- unname(map[x[hit]])
+  x
+}
+disease_colors <- c(Healthy = "#999999", KD = "#51999f", pSS = "#ea9e58", RA = "#c9dcc4",
+  SLE = "#d9b9d4", BD = "#7c9895", IIH = "#92a5d1", GCA = "#ac3827", `MIS-C` = "#ef8a62",
+  FEB = "#fddbc7", MS = "#afadd2", CD = "#4393c3", axSpA = "#2166ac", `CD-axSpA` = "#053061")
+lineage_colors <- c(B = "#f9c8b2", Plasma = "#d6bbc4", `Mono/Macro/Neutro` = "#B2D8CE",
+                     DC = "#3a9898", NK = "#8ab0d8", T = "#939eb2")
+pdc_labels <- c("pDC", "pDC_LILRA4")
+dc_labels <- c(pdc_labels, "cDC1", "cDC2", "cDC1_CLEC9A", "cDC2_CD1C", "DC_LAMP3", "preDCs", "ABDC_AXL")
+
+# Fig. 1A: original cell-count plot plus a simple disease overview replacing the missing schematic.
+fig1A <- function(atlas) {
+  counts <- tibble(Disease = standardize_disease(atlas$majordisease)) %>% count(Disease, name = "TotalCells")
+  overview <- counts %>% arrange(Disease) %>%
+    mutate(x = (row_number() - 1) %% 3, y = -((row_number() - 1) %/% 3))
+  p_left <- ggplot(overview, aes(x, y, fill = Disease)) +
+    geom_tile(width = 0.92, height = 0.8, alpha = 0.35) +
+    geom_text(aes(label = Disease), size = 3.5) + scale_fill_manual(values = disease_colors) +
+    theme_void() + theme(legend.position = "none") + labs(title = "Study groups")
+  p_right <- ggplot(counts, aes(reorder(Disease, TotalCells), TotalCells, fill = Disease)) +
+    geom_col(width = 0.65, alpha = 0.9) +
+    geom_text(aes(label = scales::comma(TotalCells)), hjust = -0.15, size = 3.2) +
+    scale_fill_manual(values = disease_colors) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.25))) + coord_flip() +
+    theme_classic() + labs(x = NULL, y = "Cells", subtitle = paste("Total cells:", sum(counts$TotalCells))) +
+    theme(legend.position = "none")
+  save_fig(p_left + p_right, "Fig1A_overview_and_cell_counts.pdf", 10, 5)
+  write.csv(counts, file.path(out_dir, "Fig1A_cell_counts.csv"), row.names = FALSE)
+}
+
+# Fig. 1B: annotated cell subsets on the integrated atlas UMAP.
+fig1B <- function(atlas, cell_colors = NULL) {
+  p <- DimPlot(atlas, reduction = "umap", group.by = "celltype", cols = cell_colors,
+               label = TRUE, repel = TRUE, raster = TRUE) +
+    labs(subtitle = paste("n =", format(ncol(atlas), big.mark = ","), "cells"))
+  save_fig(p, "Fig1B_cell_subset_UMAP.pdf", 10, 6)
+}
+
+# Shared Fig. 1C-D denominator and sample filters from the source pDC analysis.
+# Exclude GSE242615B, FEB and IIH; retain samples with >=200 atlas immune cells.
+prepare_abundance <- function(atlas, min_cells = 200) {
+  md <- atlas[[]]
+  stopifnot(all(c("Sample", "Data", "majordisease", "majorcluster", "celltype") %in% names(md)))
+  valid <- md %>% count(Sample) %>% filter(n >= min_cells) %>% pull(Sample)
+  md <- md %>% mutate(majordisease = standardize_disease(majordisease)) %>%
+    filter(Sample %in% valid, Data != "GSE242615B", !majordisease %in% c("FEB", "IIH"))
+  md %>% group_by(Sample, majordisease) %>%
+    summarise(Total = n(), B = sum(majorcluster == "B"), Plasma = sum(majorcluster == "Plasma"),
+      DC = sum(majorcluster == "DC"), pDC = sum(celltype %in% pdc_labels),
+      T = sum(majorcluster %in% c("T", "CD4", "CD8", "Other_T")), .groups = "drop") %>%
+    mutate(across(c(B, Plasma, DC, pDC, T), ~ .x / Total))
+}
+proportion_plot <- function(data, population, method = "kruskal.test", comparisons = NULL) {
+  disease_order <- data %>% group_by(majordisease) %>%
+    summarise(m = median(.data[[population]]), .groups = "drop") %>%
+    filter(majordisease != "Healthy") %>% arrange(desc(m)) %>% pull(majordisease)
+  data$majordisease <- factor(data$majordisease, levels = c("Healthy", disease_order))
+  color <- if (population == "pDC") "#B7EA63" else lineage_colors[[population]]
+  ggplot(data, aes(majordisease, .data[[population]])) +
+    geom_boxplot(color = color, outlier.shape = NA, width = 0.6) +
+    geom_jitter(color = color, width = 0.2, size = 1.5) +
+    stat_compare_means(method = method, comparisons = comparisons, label = "p.format") +
+    theme_classic() + labs(x = NULL, y = paste("Proportion of", population, "among immune cells")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+fig1CD <- function(atlas) {
+  proportions <- prepare_abundance(atlas)
+  panels <- lapply(c("B", "Plasma", "DC"), function(ct) proportion_plot(proportions, ct))
+  save_fig(wrap_plots(panels, ncol = 3), "Fig1C_B_Plasma_DC_proportions.pdf", 16, 5)
+  save_fig(proportion_plot(proportions, "pDC"), "Fig1D_pDC_proportions.pdf", 6, 5)
+  write.csv(proportions, file.path(out_dir, "sample_immune_proportions.csv"), row.names = FALSE)
+  invisible(proportions)
+}
+
+# Fig. 1E: GO of genes upregulated in disease pDCs versus Healthy.
+# Supply a pDC-only object with test labels "aids" and "Healthy", as in the source.
+fig1E <- function(pdc) {
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  DefaultAssay(pdc) <- "RNA"
+  stopifnot(all(pdc$celltype %in% pdc_labels), all(c("aids", "Healthy") %in% pdc$test))
+  deg <- FindMarkers(pdc, group.by = "test", ident.1 = "aids", ident.2 = "Healthy")
+  up <- deg %>% rownames_to_column("gene") %>% filter(avg_log2FC > 0.25, p_val_adj < 0.05)
+  go <- enrichGO(gene = up$gene, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP",
+                 pAdjustMethod = "BH", pvalueCutoff = 0.05)
+  terms <- c("leukocyte chemotaxis", "defense response to bacterium",
+             "antigen processing and presentation of peptide antigen via MHC class II", "actin nucleation")
+  dat <- as.data.frame(go) %>% filter(Description %in% terms) %>% arrange(p.adjust) %>%
+    mutate(Description = forcats::fct_reorder(Description, -log10(p.adjust)))
+  p <- ggplot(dat, aes(Description, -log10(p.adjust))) +
+    geom_segment(aes(xend = Description, yend = 0), color = "gray70") +
+    geom_point(size = 6, color = "#6fbfd7") + geom_text(aes(label = Count), color = "white", size = 3) +
+    coord_flip() + theme_classic() + labs(x = NULL, y = expression(-log[10](adjusted~P)))
+  save_fig(p, "Fig1E_pDC_GO.pdf", 8, 3)
+  write.csv(as.data.frame(go), file.path(out_dir, "pDC_GO_all_terms.csv"), row.names = FALSE)
+  invisible(list(deg = deg, go = go))
+}
+
+# Fig. 1F: compute RO/E from each tissue's complete myeloid background, then select DC rows.
+# Column groups and their exact metadata values are supplied explicitly.
+calculate_tissue_roe <- function(object, group_col, group_values, min_cells = 201, skin_filter = FALSE) {
+  md <- object[[]]
+  stopifnot(all(c("Sample", "celltype", group_col) %in% names(md)))
+  valid <- md %>% count(Sample) %>% filter(n >= min_cells) %>% pull(Sample)
+  md <- md %>% filter(Sample %in% valid)
+  if (skin_filter) {
+    stopifnot(all(c("Disease", "Tissue") %in% names(md)))
+    md <- md %>% filter(!Disease %in% c("AD", "Hidradenitis Suppurativa", "Psoriasis"),
+                        Tissue != "Nonlesional skin")
+  }
+  md <- md[md[[group_col]] %in% group_values, , drop = FALSE]
+  labels <- as.character(md$celltype)
+  aliases <- c(pDC_LILRA4 = "pDC", cDC1_CLEC9A = "cDC1", cDC2_CD1C = "cDC2", ABDC_AXL = "preDCs")
+  hit <- labels %in% names(aliases); labels[hit] <- unname(aliases[labels[hit]])
+  observed <- table(labels, factor(md[[group_col]], levels = group_values))
+  stopifnot(all(colSums(observed) > 0))
+  expected <- outer(as.numeric(rowSums(observed)), as.numeric(colSums(observed))) / sum(observed)
+  roe <- observed / expected
+  desired <- c("cDC1", "cDC2", "pDC", "DC_LAMP3", "preDCs")
+  result <- matrix(NA_real_, length(desired), length(group_values), dimnames = list(desired, group_values))
+  keep <- intersect(desired, rownames(roe)); result[keep, ] <- roe[keep, , drop = FALSE]
+  result
+}
+fig1F <- function(blood_myeloid, colon_myeloid, skin_myeloid,
+                  blood_groups = c("Healthy", "CD", "SLE"), colon_groups, skin_groups) {
+  blood <- calculate_tissue_roe(blood_myeloid, "majordisease", blood_groups)
+  intestine <- calculate_tissue_roe(colon_myeloid, "Disease", colon_groups)
+  skin <- calculate_tissue_roe(skin_myeloid, "Disease", skin_groups, skin_filter = TRUE)
+  colors <- colorRamp2(c(0.3, 1, 3), c("#619db8", "#f7f7f7", "#c85d4d"))
+  make_ht <- function(mat, title, legend = FALSE, row_names = FALSE) {
+    Heatmap(mat, name = title, col = colors, na_col = "#eeeeee", cluster_rows = FALSE,
+      cluster_columns = FALSE, show_heatmap_legend = legend, show_row_names = row_names,
+      column_title = title, column_names_rot = 45, rect_gp = grid::gpar(col = "white", lwd = 1.5),
+      heatmap_legend_param = list(title = "Ro/e"))
+  }
+  pdf(file.path(out_dir, "Fig1F_cross_tissue_DC_ROE.pdf"), width = 10, height = 5)
+  draw(make_ht(blood, "Peripheral blood", TRUE, TRUE) + make_ht(intestine, "Intestinal tissue") + make_ht(skin, "Skin"))
+  dev.off()
+  for (nm in c("blood", "intestine", "skin")) write.csv(get(nm), file.path(out_dir, paste0("DC_ROE_", nm, ".csv")))
+  invisible(list(blood = blood, intestine = intestine, skin = skin))
+}
+
+# Fig. 1G: GSE64486 coronary artery ssGSEA using the first 10 pDC markers in the source ranking.
+fig1G <- function(expression_file, pdc_marker_genes, sample_metadata = NULL) {
+  library(GSVA)
+  if (is.null(sample_metadata)) sample_metadata <- data.frame(
+    Sample = c("X10229X1", "X10229X2", "X8502X3", "X9374X3", "X10229X3", "X8502X4", "X8898X1", "X8898X2",
+               "X8502X1", "X8502X2", "X8898X3", "X8898X4", "X8898X5", "X8898X7", "X8898X8"),
+    Group = c(rep("KD", 8), rep("HC", 7)))
+  bulk <- data.table::fread(expression_file, data.table = FALSE)
+  colnames(bulk)[2] <- "Gene_Symbol"
+  # Match R-sanitized sample names without dropping an arbitrary expression column.
+  stopifnot(!anyDuplicated(make.names(colnames(bulk))))
+  colnames(bulk) <- make.names(colnames(bulk))
+  stopifnot(all(sample_metadata$Sample %in% colnames(bulk)), !anyDuplicated(sample_metadata$Sample))
+  dat <- bulk %>% filter(!is.na(Gene_Symbol), Gene_Symbol != "") %>%
+    select(Gene_Symbol, all_of(sample_metadata$Sample)) %>% group_by(Gene_Symbol) %>%
+    summarise(across(everything(), mean), .groups = "drop")
+  mat <- dat %>% column_to_rownames("Gene_Symbol") %>% as.matrix()
+  stopifnot(is.numeric(mat), all(is.finite(mat)))
+  signature <- head(unique(pdc_marker_genes), 10)
+  stopifnot(length(signature) == 10)
+  param <- ssgseaParam(exprData = mat, geneSets = list(pDC_Signature = signature), alpha = 0.25, normalize = TRUE)
+  scores <- gsva(param)
+  dat <- tibble(Sample = colnames(scores), pDC_Score = as.numeric(scores[1, ])) %>%
+    left_join(sample_metadata, by = "Sample") %>% mutate(Group = factor(Group, levels = c("HC", "KD")))
+  p <- ggplot(dat, aes(Group, pDC_Score)) +
+    geom_boxplot(aes(fill = Group, color = Group), outlier.shape = NA, alpha = 0.35, width = 0.35) +
+    geom_jitter(aes(fill = Group, color = Group), width = 0.08, shape = 21, size = 3) +
+    scale_fill_manual(values = c(HC = "#999999", KD = "#51999f")) +
+    scale_color_manual(values = c(HC = "#777777", KD = "#386b6f")) +
+    stat_compare_means(method = "wilcox.test", label = "p.format") +
+    theme_classic() + labs(x = NULL, y = "pDC signature score (ssGSEA)") + theme(legend.position = "none")
+  save_fig(p, "Fig1G_coronary_pDC_signature.pdf", 4, 4)
+  write.csv(dat, file.path(out_dir, "coronary_pDC_signature_scores.csv"), row.names = FALSE)
+  invisible(dat)
+}
+
+# Supplementary Fig. 1A: canonical lineage markers.
+sfig1A <- function(atlas) {
+  features <- c("PTPRC", "MS4A1", "CD79A", "MZB1", "CD3D", "CD3E", "CD8A", "CD4", "KLRF1", "CD68", "LYZ")
+  p <- FeaturePlot(atlas, features = features, cols = c("lightgrey", "darkred"), ncol = 4) & NoAxes()
+  save_fig(p, "SFig1A_lineage_markers.pdf", 14, 9)
+}
+
+# Supplementary Fig. 1B: call separately for each annotated lineage object.
+# unique_per_subset reproduces the sequential non-overlapping marker selection in the T/NK scripts.
+sfig1B <- function(object, lineage_name, subset_order = unique(as.character(object$celltype)),
+                   unique_per_subset = TRUE) {
+  DefaultAssay(object) <- "RNA"
+  Idents(object) <- "celltype"
+  markers <- FindAllMarkers(object, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  selected <- character()
+  for (ct in subset_order) {
+    genes <- markers %>% filter(cluster == ct) %>% arrange(desc(avg_log2FC)) %>% pull(gene)
+    if (unique_per_subset) genes <- setdiff(genes, selected)
+    selected <- c(selected, head(genes, 5))
+  }
+  object$celltype <- factor(object$celltype, levels = subset_order)
+  p <- DotPlot(object, features = unique(selected), group.by = "celltype", cols = "RdYlBu") +
+    RotatedAxis() + theme_bw() + theme(panel.grid = element_blank()) + labs(x = NULL, y = NULL)
+  save_fig(p, paste0("SFig1B_", lineage_name, "_markers.pdf"), 14, 4)
+  invisible(markers)
+}
+
+# Supplementary Fig. 2A-B: source datasets and pooled lineage composition.
+sfig2AB <- function(atlas) {
+  save_fig(DimPlot(atlas, group.by = "Data", raster = TRUE) + theme_void(), "SFig2A_dataset_UMAP.pdf", 7, 5)
+  dat <- atlas[[]] %>% filter(Data != "GSE242615B") %>%
+    mutate(majordisease = standardize_disease(majordisease)) %>%
+    count(majordisease, majorcluster) %>% group_by(majordisease) %>% mutate(proportion = n / sum(n))
+  p <- ggplot(dat, aes(majordisease, proportion, fill = majorcluster)) +
+    geom_col(width = 0.75) + scale_fill_manual(values = lineage_colors) +
+    scale_y_continuous(labels = scales::label_percent()) + theme_classic() +
+    labs(x = NULL, y = "Percentage (%)", fill = NULL) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+  save_fig(p, "SFig2B_lineage_composition.pdf", 8, 5)
+}
+
+# Supplementary Fig. 2C: selected pairwise comparisons using the same abundance table.
+sfig2C <- function(atlas) {
+  dat <- prepare_abundance(atlas)
+  b <- proportion_plot(filter(dat, majordisease %in% c("Healthy", "KD", "MIS-C", "GCA")), "B", "wilcox.test",
+                        list(c("Healthy", "KD"), c("Healthy", "MIS-C"), c("Healthy", "GCA")))
+  plasma <- proportion_plot(filter(dat, majordisease %in% c("Healthy", "KD", "MIS-C")), "Plasma", "wilcox.test",
+                             list(c("Healthy", "KD"), c("Healthy", "MIS-C")))
+  t <- proportion_plot(filter(dat, majordisease %in% c("Healthy", "SLE")), "T", "wilcox.test")
+  save_fig(b + plasma + t, "SFig2C_selected_cell_proportions.pdf", 10, 4)
+}
+
+# Supplementary Fig. 2D-E: pooled DC percentages and within-DC composition.
+sfig2DE <- function(atlas) {
+  md <- atlas[[]] %>% filter(Data != "GSE242615B") %>%
+    mutate(majordisease = standardize_disease(majordisease))
+  dc_prop <- md %>% group_by(majordisease) %>%
+    summarise(Percentage = mean(celltype %in% c(pdc_labels, "cDC1", "cDC2", "cDC1_CLEC9A", "cDC2_CD1C")) * 100, .groups = "drop")
+  p <- ggplot(dc_prop, aes(reorder(majordisease, -Percentage), Percentage)) +
+    geom_col(fill = "#3a9898") + geom_hline(yintercept = 2, linetype = "dashed", color = "grey50") +
+    theme_classic() + labs(x = NULL, y = "DC among immune cells (%)") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_fig(p, "SFig2D_DC_percentage.pdf", 6, 4)
+  composition <- md %>% mutate(DC_subset = case_when(celltype %in% pdc_labels ~ "pDC",
+    celltype %in% c("cDC1", "cDC1_CLEC9A") ~ "cDC1", celltype %in% c("cDC2", "cDC2_CD1C") ~ "cDC2")) %>%
+    filter(!is.na(DC_subset)) %>% count(majordisease, DC_subset) %>% group_by(majordisease) %>% mutate(Percentage = n / sum(n) * 100)
+  p <- ggplot(composition, aes(majordisease, Percentage, fill = DC_subset)) + geom_col() +
+    scale_fill_manual(values = c(cDC1 = "#8bcff0", cDC2 = "#d5c9db", pDC = "#b7ea63")) +
+    theme_classic() + labs(x = NULL, y = "Percentage among DCs", fill = NULL) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  save_fig(p, "SFig2E_DC_composition.pdf", 7, 4)
+}
+
+# Supplementary Fig. 2F: tissue-specific marker plots; supply the selected marker vectors.
+sfig2F <- function(colon, skin, colon_markers, skin_markers) {
+  left <- DotPlot(colon, features = colon_markers, group.by = "celltype", cols = "RdYlBu") + RotatedAxis()
+  right <- DotPlot(skin, features = skin_markers, group.by = "celltype", cols = "RdYlBu") + RotatedAxis()
+  save_fig(left + right, "SFig2F_tissue_myeloid_markers.pdf", 12, 5)
+}
+
+# Example calls (objects and paths must be supplied from the original analysis).
+# fig1A(atlas); fig1B(atlas); fig1CD(atlas)
+# fig1E(pdc)
+# fig1F(blood_myeloid, colon_myeloid, skin_myeloid,
+#       colon_groups = c("Healthy", "CD_Uninflamed", "CD_Inflamed"),
+#       skin_groups = c("Healthy", "DLE", "SLE")) # replace with exact Disease values
+# fig1G("GSE64486_expression_broad.txt", mye_markers$gene[mye_markers$cluster == "pDC"])
+# sfig1A(atlas); sfig1B(b_cells, "B", unique_per_subset = FALSE)
+# sfig1B(cd4_cells, "CD4"); sfig1B(cd8_cells, "CD8"); sfig1B(nk_cells, "NK")
+# sfig1B(myeloid, "Myeloid")
+# sfig2AB(atlas); sfig2C(atlas); sfig2DE(atlas)
