@@ -1,0 +1,318 @@
+# Fig. 5A-E and Supplementary Fig. 6A/B.
+# Fig. 5C counts cells after unique cell-subset assignment, not dominant-module samples.
+# W: cell subset x module; H/H_prop: module x sample. PCA points represent samples.
+
+library(Seurat)
+library(NMF)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+
+prepare_nmf <- function(sobj) {
+  required <- c("Sample", "celltype", "Data", "majordisease", "majorcluster")
+  stopifnot(all(required %in% colnames(sobj[[]])))
+  meta <- sobj[[]] %>%
+    filter(celltype != "proliferating T/NK", Data != "GSE242615B")
+  valid_samples <- meta %>% count(Sample) %>% filter(n >= 500) %>% pull(Sample)
+  meta <- meta %>% filter(Sample %in% valid_samples)
+  counts <- table(as.character(meta$Sample), as.character(meta$celltype))
+  ratio_matrix <- sweep(as.matrix(counts), 1, rowSums(counts), "/")
+  scaled_matrix <- apply(ratio_matrix, 2, function(x) {
+    r <- range(x)
+    if (diff(r) == 0) rep(0, length(x)) else (x - r[1]) / diff(r)
+  })
+  dimnames(scaled_matrix) <- dimnames(ratio_matrix)
+  sample_info <- meta %>% distinct(Sample, majordisease)
+  if (anyDuplicated(sample_info$Sample)) stop("Conflicting disease labels within a Sample.")
+  sample_info <- sample_info[match(rownames(ratio_matrix), sample_info$Sample), ]
+  cell_info <- meta %>% distinct(celltype, majorcluster)
+  if (anyDuplicated(cell_info$celltype)) stop("Conflicting lineage labels within a cell subset.")
+  list(ratio_matrix = ratio_matrix, nmf_input = t(scaled_matrix),
+       sample_info = sample_info, cell_info = cell_info, metadata = meta)
+}
+
+# Supplementary Fig. 6A: rank survey, ranks 2-12, 30 runs per rank.
+run_rank_survey <- function(prepared, out_dir = "fig5_nmf") {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  survey <- nmf(prepared$nmf_input, rank = 2:12, nrun = 30,
+                seed = 123456, method = "lee")
+  pdf(file.path(out_dir, "SFig6A_NMF_rank_survey.pdf"), width = 7, height = 7)
+  print(plot(survey))
+  dev.off()
+  saveRDS(survey, file.path(out_dir, "NMF_rank_survey.rds"))
+  invisible(survey)
+}
+
+# Reuse the original fitted model when available to preserve module identities.
+fit_nmf4 <- function(prepared) {
+  set.seed(2026)
+  nmf(prepared$nmf_input, rank = 4, nrun = 100, method = "lee")
+}
+
+# Normalize W columns and compensate H rows to preserve W %*% H.
+# module_order must match the established M1-M4 identities of the fitted model.
+extract_module_profiles <- function(model, module_order = 1:4) {
+  W <- basis(model)[, module_order, drop = FALSE]
+  H <- coef(model)[module_order, , drop = FALSE]
+  stopifnot(ncol(W) == 4, all(colSums(W) > 0))
+  module_scale <- colSums(W)
+  W <- sweep(W, 2, module_scale, "/")
+  H <- sweep(H, 1, module_scale, "*")
+  stopifnot(all(colSums(H) > 0))
+  H_prop <- sweep(H, 2, colSums(H), "/")
+  colnames(W) <- rownames(H) <- rownames(H_prop) <- paste0("M", 1:4)
+  list(W_mat = W, H_mat = H, H_prop = H_prop)
+}
+
+# Use matching W_mat/H_prop directly when these matrices are already finalized.
+plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
+                      disease_groups = c("BD", "CD", "GCA", "IIH", "KD", "MIS-C", "MS", "pSS", "SLE"),
+                      pca_df = NULL, pca_variance = NULL, linkage = "complete", distance_linkage = "average",
+                      category_map = NULL, model = NULL, assignment_weights = W_mat,
+                      display_exclude = c("CD8Tnaive", "CD4Tnaive", "CD8Tnaive_IFN-response",
+                                          "CD4Tnaive_MX1", "CD8Tcm_IFN-response")) {
+  if (is.null(pca_df) || is.null(pca_variance))
+    stop("Supply the original pca_df and variance objects from the PCA analysis.")
+  stopifnot(all(c("PC1", "PC2", "Disease", "Sample") %in% names(pca_df)),
+            length(pca_variance) >= 2, all(is.finite(pca_variance[1:2])),
+            !anyDuplicated(pca_df$Sample))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  stopifnot(ncol(W_mat) == 4, nrow(H_prop) == 4,
+            all(abs(colSums(W_mat) - 1) < 1e-6),
+            all(abs(colSums(H_prop) - 1) < 1e-6),
+            all(is.finite(W_mat)), all(is.finite(H_prop)),
+            all(W_mat >= 0), all(H_prop >= 0))
+  if (!identical(colnames(W_mat), rownames(H_prop))) stop("W and H_prop module names/order differ.")
+  mods <- colnames(W_mat)
+  samples <- colnames(H_prop)
+  stopifnot(!is.null(samples), all(samples %in% prepared$sample_info$Sample),
+            all(rownames(W_mat) %in% colnames(prepared$ratio_matrix)))
+  info <- prepared$sample_info[match(samples, prepared$sample_info$Sample), ]
+  disease_map <- c("Behçet’s disease" = "BD", "Behçet's disease" = "BD",
+    "Systemic lupus erythematosus" = "SLE", "idiopathic intracranial hypertension" = "IIH",
+    "Giant cell arteritis" = "GCA", "Mutiple sclerosis" = "MS", "Multiple sclerosis" = "MS",
+    "PSS" = "pSS", "Spondyloarthritis" = "axSpA", AS = "axSpA",
+    "Co-morbid CD and Spondyloarthritis" = "CD-axSpA", CDAS = "CD-axSpA",
+    "Febrile control+URI" = "FEB")
+  info$majordisease <- trimws(as.character(info$majordisease))
+  hit <- info$majordisease %in% names(disease_map)
+  info$majordisease[hit] <- unname(disease_map[info$majordisease[hit]])
+  info$Module <- factor(mods[max.col(t(H_prop), ties.method = "first")], levels = mods)
+  # Supply basis(model) in matching module order to exactly reproduce legacy raw-W assignment.
+  stopifnot(identical(dim(assignment_weights), dim(W_mat)),
+            identical(rownames(assignment_weights), rownames(W_mat)))
+  cell_module <- factor(mods[max.col(assignment_weights, ties.method = "first")], levels = mods)
+  names(cell_module) <- rownames(W_mat)
+  disease_colors <- setNames(scales::hue_pal()(length(unique(info$majordisease))), sort(unique(info$majordisease)))
+
+  # Fig. 5A: Z-score/4 of cell proportions, split by dominant modules.
+  # The five exclusions reproduce the supplied display only; NMF/W/H retain these subsets.
+  display_module <- cell_module
+  display_sample_module <- info$Module
+  if (!is.null(model)) {
+    # Reproduce extractFeatures(..., "max") and predict(model) from the source heatmap.
+    raw_W <- basis(model)
+    raw_W <- sweep(raw_W, 2, colSums(raw_W), "/")
+    stopifnot(identical(rownames(raw_W), rownames(W_mat)),
+              isTRUE(all.equal(unname(raw_W), unname(W_mat), tolerance = 1e-6)))
+    patterns <- extractFeatures(model, "max")
+    display_cells <- rownames(raw_W)[unlist(patterns)]
+    display_module <- factor(rep(mods, lengths(patterns)), levels = mods)
+    names(display_module) <- display_cells
+    predicted <- predict(model)
+    stopifnot(all(samples %in% names(predicted)))
+    display_sample_module <- factor(mods[as.integer(as.character(predicted[samples]))], levels = mods)
+  } else {
+    display_cells <- rownames(W_mat)[order(cell_module)]
+  }
+  display_cells <- setdiff(display_cells, display_exclude)
+  z <- t(scale(prepared$ratio_matrix[samples, rownames(W_mat), drop = FALSE])) / 4
+  z[!is.finite(z)] <- 0
+  sample_order <- order(display_sample_module)
+  mat <- z[display_cells, sample_order, drop = FALSE]
+  ha <- HeatmapAnnotation(Disease = info$majordisease[sample_order],
+                           col = list(Disease = disease_colors))
+  ht <- Heatmap(mat, name = "Z-score / 4", top_annotation = ha,
+    column_split = display_sample_module[sample_order], row_split = display_module[display_cells],
+    col = colorRamp2(c(-1, 0, 1), c("#2166ac", "white", "#b2182b")),
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    cluster_row_slices = FALSE, cluster_column_slices = FALSE,
+    show_column_names = FALSE, row_title = NULL,
+    column_title = paste0("Samples: ", length(samples)), row_names_gp = grid::gpar(fontsize = 8))
+  pdf(file.path(out_dir, "Fig5A_sample_cell_abundance.pdf"), width = 16, height = 6)
+  draw(ht); dev.off()
+
+  # Fig. 5B: summed W weights within T, NK, B (including plasma), and myeloid (including DC).
+  lineage_info <- prepared$cell_info[match(rownames(W_mat), prepared$cell_info$celltype), ]
+  lineage_map <- c(T = "T", CD4 = "T", CD8 = "T", NK = "NK", B = "B", Plasma = "B",
+    DC = "Mye", Myeloid = "Mye", Mye = "Mye", "Mono/Macro/Neutro" = "Mye", "Mono/Neutro" = "Mye")
+  lineage <- unname(lineage_map[as.character(lineage_info$majorcluster)])
+  if (anyNA(lineage)) stop("Add unrecognized majorcluster names to lineage_map.")
+  contribution <- rowsum(W_mat, group = lineage)
+  contribution <- contribution[intersect(c("T", "NK", "B", "Mye"), rownames(contribution)), , drop = FALSE] * 100
+  ht <- Heatmap(contribution, name = "NMF weight (%)", cluster_rows = FALSE, cluster_columns = FALSE,
+    col = colorRamp2(c(0, 50, 100), c("#b5d4d0", "#f4e7d6", "#d68b74")),
+    cell_fun = function(j, i, x, y, width, height, fill) grid::grid.text(sprintf("%.1f%%", contribution[i,j]), x, y))
+  pdf(file.path(out_dir, "Fig5B_lineage_contributions.pdf"), width = 5, height = 4)
+  draw(ht); dev.off()
+
+  # Fig. 5C: mutually exclusive cell-subset assignments, then pooled cell-count RO/E.
+  # This follows the first (deduplicated) analysis in the supplied RO/E script.
+  mapping <- tibble(celltype = names(cell_module), Assigned_Module = cell_module)
+  base_df <- prepared$metadata %>% filter(Sample %in% samples) %>%
+    select(-majordisease) %>%
+    left_join(info %>% select(Sample, majordisease), by = "Sample") %>%
+    left_join(mapping, by = "celltype") %>% filter(!is.na(Assigned_Module))
+  observed <- table(base_df$Assigned_Module, base_df$majordisease)
+  observed <- observed[rowSums(observed) > 0, colSums(observed) > 0, drop = FALSE]
+  expected <- outer(as.numeric(rowSums(observed)), as.numeric(colSums(observed))) / sum(observed)
+  roe <- observed / expected
+  if (is.null(category_map)) {
+    category_map <- c(Healthy = "Control", FEB = "Control", IIH = "Neurological",
+      `MIS-C` = "Systemic", KD = "Systemic", RA = "Systemic", GCA = "Systemic",
+      BD = "Systemic", pSS = "Systemic", SLE = "Systemic", CD = "Localized",
+      `CD-axSpA` = "Localized", axSpA = "Localized", MS = "Localized")
+  }
+  categories <- unname(category_map[colnames(roe)])
+  if (anyNA(categories)) stop("category_map must cover every disease in Fig. 5C.")
+  annotation <- HeatmapAnnotation(Category = categories,
+    col = list(Category = c(Control = "#b6ead6", Neurological = "#8b91cf",
+                            Systemic = "#fca09f", Localized = "#c9def9")))
+  ht <- Heatmap(roe, name = "Ro/e", top_annotation = annotation,
+    cluster_rows = FALSE, cluster_columns = TRUE,
+    clustering_distance_columns = "euclidean", clustering_method_columns = linkage,
+    col = colorRamp2(c(min(roe), 1, max(roe)), c("#619db8", "white", "#c85d4d")),
+    rect_gp = grid::gpar(col = "white", lwd = 2.3))
+  pdf(file.path(out_dir, "Fig5C_module_disease_ROE.pdf"), width = 8, height = 3.5)
+  draw(ht); dev.off()
+  write.csv(mapping, file.path(out_dir, "cell_subset_unique_modules.csv"), row.names = FALSE)
+  write.csv(observed, file.path(out_dir, "module_disease_observed_cells.csv"))
+
+  # Fig. 5D: disease-mean four-module profiles, Euclidean distance, average linkage (1105.R).
+  sample_profiles <- as.data.frame(t(H_prop)) %>%
+    mutate(Sample = samples, Disease = info$majordisease)
+  selected <- sample_profiles %>% filter(Disease %in% disease_groups)
+  disease_profiles <- selected %>% group_by(Disease) %>%
+    summarise(across(all_of(mods), mean), .groups = "drop") %>%
+    column_to_rownames("Disease") %>% as.matrix()
+  stopifnot(nrow(disease_profiles) >= 2)
+  distance <- dist(disease_profiles, method = "euclidean")
+  hc <- hclust(distance, method = distance_linkage)
+  distance_matrix <- as.matrix(distance)
+  ht <- Heatmap(distance_matrix, name = "Euclidean distance", cluster_rows = hc, cluster_columns = hc,
+    col = colorRamp2(c(0, max(distance_matrix)/2, max(distance_matrix)), c("#FFFFFF", "#F5B041", "#922B21")))
+  pdf(file.path(out_dir, "Fig5D_disease_module_distances.pdf"), width = 8, height = 7)
+  draw(ht); dev.off()
+
+  # Fig. 5E: use existing sample coordinates; filter for display only, without refitting PCA.
+  # variance in 1105.R is already expressed as percentages.
+  scores <- as.data.frame(pca_df)
+  scores$Disease <- trimws(as.character(scores$Disease))
+  hit <- scores$Disease %in% names(disease_map)
+  scores$Disease[hit] <- unname(disease_map[scores$Disease[hit]])
+  scores <- scores %>% filter(Disease %in% disease_groups)
+  stopifnot(nrow(scores) > 0, all(scores$Sample %in% samples),
+            all(is.finite(scores$PC1)), all(is.finite(scores$PC2)))
+  aid_colors <- c(BD = "#7c9895", CD = "#8e7dbe", GCA = "#a9b388", KD = "#51999f",
+                  `MIS-C` = "#e28e8e", MS = "#778899", pSS = "#ea9e58", SLE = "#d9b9d4", IIH = "#92a5d1")
+  p <- ggplot(scores, aes(PC1, PC2, color = Disease)) +
+    geom_point(size = 3.2, alpha = 0.9) + scale_color_manual(values = aid_colors) +
+    labs(x = paste0("PC1 (", round(pca_variance[1], 1), "%)"),
+         y = paste0("PC2 (", round(pca_variance[2], 1), "%)"), color = NULL) +
+    coord_equal() + theme_classic(base_size = 13) +
+    theme(axis.text = element_text(color = "black", size = 11),
+          axis.title = element_text(color = "black", size = 13),
+          legend.position = "right", legend.text = element_text(size = 11),
+          legend.key.height = grid::unit(0.6, "cm"))
+  ggsave(file.path(out_dir, "Fig5E_sample_module_PCA.pdf"), p, width = 7.5, height = 5.5)
+  write.csv(info, file.path(out_dir, "sample_dominant_modules.csv"), row.names = FALSE)
+  write.csv(W_mat, file.path(out_dir, "W_cell_module_weights.csv"))
+  write.csv(H_prop, file.path(out_dir, "H_sample_module_proportions.csv"))
+  write.csv(contribution, file.path(out_dir, "lineage_contributions.csv"))
+  write.csv(roe, file.path(out_dir, "module_disease_ROE.csv"))
+  write.csv(disease_profiles, file.path(out_dir, "disease_mean_module_profiles.csv"))
+  write.csv(distance_matrix, file.path(out_dir, "disease_distances.csv"))
+  write.csv(scores, file.path(out_dir, "sample_PCA_scores.csv"), row.names = FALSE)
+  saveRDS(list(scores = scores, variance_percent = pca_variance), file.path(out_dir, "sample_PCA_plot_inputs.rds"))
+  writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+  invisible(list(sample_info = info, cell_modules = cell_module, roe = roe, pca_scores = scores))
+}
+
+# Example: use already-curated metadata and the established W/H pair.
+# prepared <- prepare_nmf(sobj)
+# run_rank_survey(prepared)
+# model <- fit_nmf4(prepared)  # omit when the original fitted model is available
+# profiles <- extract_module_profiles(model, module_order = 1:4)
+# result <- plot_fig5(prepared, profiles$W_mat, profiles$H_prop, pca_df = pca_df, pca_variance = variance, model = model,
+#                     assignment_weights = basis(model))
+# Or: result <- plot_fig5(prepared, W_mat, H_prop, pca_df = pca_df, pca_variance = variance)
+# The supplied category mapping is included; override category_map if needed.
+# Stop at sample-level PCA; no subsequent analyses are included.
+
+# Supplementary Fig. 6B: module-member abundance correlations across non-Healthy samples.
+# Source nmf_cm.r uses Pearson and top 8 W-ranked subsets (membership may overlap).
+# Set method = "spearman" for the manuscript legend, or members = "exclusive" for unique modules.
+plot_module_networks <- function(prepared, W_mat, out_dir = "fig5_nmf",
+                                method = "pearson", members = "top8",
+                                threshold = 0.4, positive_only = TRUE) {
+  method <- match.arg(method, c("pearson", "spearman"))
+  members <- match.arg(members, c("top8", "exclusive"))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  patient_samples <- prepared$sample_info$Sample[prepared$sample_info$majordisease != "Healthy"]
+  patient_samples <- intersect(patient_samples, colnames(prepared$nmf_input))
+  stopifnot(length(patient_samples) >= 3)
+  X <- prepared$nmf_input[rownames(W_mat), patient_samples, drop = FALSE]
+  variable_cells <- apply(X, 1, sd) > 0
+  correlation <- cor(t(X[variable_cells, , drop = FALSE]), method = method)
+  assignments <- max.col(W_mat, ties.method = "first")
+  groups <- lapply(seq_len(ncol(W_mat)), function(k) {
+    if (members == "top8") rownames(W_mat)[head(order(W_mat[, k], decreasing = TRUE), 8)] else
+      rownames(W_mat)[assignments == k]
+  })
+  names(groups) <- colnames(W_mat)
+  lin <- prepared$cell_info$majorcluster[match(rownames(W_mat), prepared$cell_info$celltype)]
+  names(lin) <- rownames(W_mat)
+  lineage_colors <- setNames(scales::hue_pal()(length(unique(lin))), sort(unique(lin)))
+  edges_export <- list()
+  set.seed(2026)
+  pdf(file.path(out_dir, "SFig6B_module_correlations.pdf"), width = 10, height = 8)
+  oldpar <- par(mfrow = c(2, 2), mar = c(1, 1, 3, 1))
+  for (k in seq_along(groups)) {
+    nodes <- intersect(groups[[k]], rownames(correlation))
+    if (length(nodes) < 2) {
+      plot.new(); title(paste(names(groups)[k], "fewer than 2 variable subsets")); next
+    }
+    R <- correlation[nodes, nodes, drop = FALSE]
+    keep <- upper.tri(R) & (if (positive_only) R > threshold else abs(R) > threshold)
+    ij <- which(keep, arr.ind = TRUE)
+    edges <- data.frame(from = rownames(R)[ij[, 1]], to = colnames(R)[ij[, 2]],
+                        weight = R[ij], Module = rep(names(groups)[k], nrow(ij)))
+    edges_export[[k]] <- edges
+    g <- igraph::graph_from_data_frame(edges[, c("from", "to", "weight")],
+                                       directed = FALSE, vertices = data.frame(name = nodes))
+    g <- igraph::delete_vertices(g, igraph::V(g)[igraph::degree(g) == 0])
+    if (!igraph::vcount(g)) {
+      plot.new(); title(paste(names(groups)[k], "no edges above threshold")); next
+    }
+    w <- igraph::E(g)$weight
+    gray <- gray.colors(100, start = 0.85, end = 0.25)
+    color_idx <- pmax(1, pmin(100, ceiling(abs(w) * 100)))
+    plot(g, layout = igraph::layout_in_circle(g),
+         vertex.color = unname(lineage_colors[lin[igraph::V(g)$name]]),
+         vertex.size = 8, vertex.label.cex = 0.55, vertex.label.color = "black",
+         edge.width = 1 + abs(w) * 3, edge.color = gray[color_idx],
+         edge.lty = ifelse(w < 0, 2, 1), main = names(groups)[k])
+  }
+  par(oldpar); dev.off()
+  write.csv(bind_rows(edges_export), file.path(out_dir, "module_correlation_edges.csv"), row.names = FALSE)
+  write.csv(stack(groups), file.path(out_dir, "network_module_members.csv"), row.names = FALSE)
+  write.csv(data.frame(Lineage = names(lineage_colors), Color = unname(lineage_colors)),
+            file.path(out_dir, "network_lineage_colors.csv"), row.names = FALSE)
+  writeLines(c(paste("Correlation:", method), paste("Membership:", members),
+               paste("Threshold:", threshold), paste("Positive edges only:", positive_only),
+               paste("Non-Healthy samples:", length(patient_samples))),
+             file.path(out_dir, "network_settings.txt"))
+  invisible(list(correlation = correlation, members = groups, edges = bind_rows(edges_export)))
+}
+
+
