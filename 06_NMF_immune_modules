@@ -67,15 +67,10 @@ extract_module_profiles <- function(model, module_order = 1:4) {
 # Use matching W_mat/H_prop directly when these matrices are already finalized.
 plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
                       disease_groups = c("BD", "CD", "GCA", "IIH", "KD", "MIS-C", "MS", "pSS", "SLE"),
-                      pca_df = NULL, pca_variance = NULL, linkage = "complete", distance_linkage = "average",
+                      linkage = "complete", distance_linkage = "average",
                       category_map = NULL, model = NULL, assignment_weights = W_mat,
                       display_exclude = c("CD8Tnaive", "CD4Tnaive", "CD8Tnaive_IFN-response",
                                           "CD4Tnaive_MX1", "CD8Tcm_IFN-response")) {
-  if (is.null(pca_df) || is.null(pca_variance))
-    stop("Supply the original pca_df and variance objects from the PCA analysis.")
-  stopifnot(all(c("PC1", "PC2", "Disease", "Sample") %in% names(pca_df)),
-            length(pca_variance) >= 2, all(is.finite(pca_variance[1:2])),
-            !anyDuplicated(pca_df$Sample))
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   stopifnot(ncol(W_mat) == 4, nrow(H_prop) == 4,
             all(abs(colSums(W_mat) - 1) < 1e-6),
@@ -97,6 +92,23 @@ plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
   info$majordisease <- trimws(as.character(info$majordisease))
   hit <- info$majordisease %in% names(disease_map)
   info$majordisease[hit] <- unname(disease_map[info$majordisease[hit]])
+
+  # PCA: sample-level four-module profiles (same settings as the original 1105 analysis).
+  module_prop <- as.data.frame(t(H_prop[mods, , drop = FALSE]))
+  pca_result <- prcomp(
+    module_prop[, mods, drop = FALSE],
+    center = TRUE,
+    scale. = FALSE
+  )
+  variance <- 100 * pca_result$sdev^2 / sum(pca_result$sdev^2)
+  pca_df <- data.frame(
+    Sample = rownames(module_prop),
+    Disease = info$majordisease[match(rownames(module_prop), info$Sample)],
+    PC1 = pca_result$x[, 1],
+    PC2 = pca_result$x[, 2]
+  )
+  stopifnot(!anyNA(pca_df$Disease), !anyDuplicated(pca_df$Sample))
+
   info$Module <- factor(mods[max.col(t(H_prop), ties.method = "first")], levels = mods)
   # Supply basis(model) in matching module order to exactly reproduce legacy raw-W assignment.
   stopifnot(identical(dim(assignment_weights), dim(W_mat)),
@@ -204,8 +216,8 @@ plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
   pdf(file.path(out_dir, "Fig5D_disease_module_distances.pdf"), width = 8, height = 7)
   draw(ht); dev.off()
 
-  # Fig. 5E: use existing sample coordinates; filter for display only, without refitting PCA.
-  # variance in 1105.R is already expressed as percentages.
+  # Fig. 5E: PCA of the four-dimensional sample-level module profiles.
+  # PCA is fitted to all samples; disease filtering below is for display only.
   scores <- as.data.frame(pca_df)
   scores$Disease <- trimws(as.character(scores$Disease))
   hit <- scores$Disease %in% names(disease_map)
@@ -217,8 +229,8 @@ plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
                   `MIS-C` = "#e28e8e", MS = "#778899", pSS = "#ea9e58", SLE = "#d9b9d4", IIH = "#92a5d1")
   p <- ggplot(scores, aes(PC1, PC2, color = Disease)) +
     geom_point(size = 3.2, alpha = 0.9) + scale_color_manual(values = aid_colors) +
-    labs(x = paste0("PC1 (", round(pca_variance[1], 1), "%)"),
-         y = paste0("PC2 (", round(pca_variance[2], 1), "%)"), color = NULL) +
+    labs(x = paste0("PC1 (", round(variance[1], 1), "%)"),
+         y = paste0("PC2 (", round(variance[2], 1), "%)"), color = NULL) +
     coord_equal() + theme_classic(base_size = 13) +
     theme(axis.text = element_text(color = "black", size = 11),
           axis.title = element_text(color = "black", size = 13),
@@ -233,9 +245,15 @@ plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
   write.csv(disease_profiles, file.path(out_dir, "disease_mean_module_profiles.csv"))
   write.csv(distance_matrix, file.path(out_dir, "disease_distances.csv"))
   write.csv(scores, file.path(out_dir, "sample_PCA_scores.csv"), row.names = FALSE)
-  saveRDS(list(scores = scores, variance_percent = pca_variance), file.path(out_dir, "sample_PCA_plot_inputs.rds"))
+  saveRDS(
+    list(pca_result = pca_result, pca_input = module_prop,
+         scores = pca_df, variance_percent = variance),
+    file.path(out_dir, "sample_PCA_plot_inputs.rds")
+  )
   writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
-  invisible(list(sample_info = info, cell_modules = cell_module, roe = roe, pca_scores = scores))
+  invisible(list(sample_info = info, cell_modules = cell_module, roe = roe,
+                 pca_result = pca_result, pca_scores = pca_df,
+                 pca_variance = variance))
 }
 
 # Example: use already-curated metadata and the established W/H pair.
@@ -243,11 +261,11 @@ plot_fig5 <- function(prepared, W_mat, H_prop, out_dir = "fig5_nmf",
 # run_rank_survey(prepared)
 # model <- fit_nmf4(prepared)  # omit when the original fitted model is available
 # profiles <- extract_module_profiles(model, module_order = 1:4)
-# result <- plot_fig5(prepared, profiles$W_mat, profiles$H_prop, pca_df = pca_df, pca_variance = variance, model = model,
+# result <- plot_fig5(prepared, profiles$W_mat, profiles$H_prop, model = model,
 #                     assignment_weights = basis(model))
-# Or: result <- plot_fig5(prepared, W_mat, H_prop, pca_df = pca_df, pca_variance = variance)
+# Or: result <- plot_fig5(prepared, W_mat, H_prop)
+# PCA is constructed internally from H_prop; no external pca_df/variance is required.
 # The supplied category mapping is included; override category_map if needed.
-# Stop at sample-level PCA; no subsequent analyses are included.
 
 # Supplementary Fig. 6B: module-member abundance correlations across non-Healthy samples.
 # Source nmf_cm.r uses Pearson and top 8 W-ranked subsets (membership may overlap).
@@ -314,5 +332,3 @@ plot_module_networks <- function(prepared, W_mat, out_dir = "fig5_nmf",
              file.path(out_dir, "network_settings.txt"))
   invisible(list(correlation = correlation, members = groups, edges = bind_rows(edges_export)))
 }
-
-
